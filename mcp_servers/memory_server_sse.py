@@ -286,21 +286,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 sse_transport = SseServerTransport("/messages/")
 
 
-async def handle_sse(request):
-    """GET /sse — establishes an SSE stream for the MCP client."""
-    async with sse_transport.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
-        await server.run(
-            streams[0], streams[1], server.create_initialization_options()
-        )
+class SSEHandler:
+    """ASGI app for GET /sse — establishes an SSE stream for the MCP client.
+
+    Must be a class (not a function) so Starlette doesn't wrap it with
+    request_response. The SseServerTransport.connect_sse already
+    sends the HTTP response via EventSourceResponse internally at the
+    ASGI level, so we must NOT return a Response from here.
+    """
+
+    async def __call__(self, scope, receive, send):
+        async with sse_transport.connect_sse(scope, receive, send) as streams:
+            await server.run(
+                streams[0], streams[1], server.create_initialization_options()
+            )
 
 
-async def handle_messages(request):
-    """POST /messages/ — receives client messages for the SSE session."""
-    await sse_transport.handle_post_message(
-        request.scope, request.receive, request._send
-    )
+class MessagesHandler:
+    """ASGI app for POST /messages/ — receives client messages.
+
+    SseServerTransport.handle_post_message sends its own response
+    directly via send, so it must also be a raw ASGI endpoint.
+    """
+
+    async def __call__(self, scope, receive, send):
+        await sse_transport.handle_post_message(scope, receive, send)
 
 
 async def health_check(request):
@@ -318,8 +328,8 @@ async def health_check(request):
 
 starlette_app = Starlette(
     routes=[
-        Route("/sse", endpoint=handle_sse),
-        Route("/messages/", endpoint=handle_messages, methods=["POST"]),
+        Route("/sse", endpoint=SSEHandler()),
+        Route("/messages/", endpoint=MessagesHandler(), methods=["POST"]),
         Route("/health", endpoint=health_check),
     ],
     middleware=[
