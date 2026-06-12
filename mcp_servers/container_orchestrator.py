@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 __all__: list[str] = [
     'validate_hostname',
     'validate_port',
@@ -42,6 +44,7 @@ __all__: list[str] = [
     'validate_key_path',
     'sanitize_for_subprocess',
     'validate_host_config',
+    'ConfigManager',
 ]
 
 # ── Input validation ──────────────────────────────────────────────────────────
@@ -202,3 +205,149 @@ def validate_host_config(config: dict) -> list[str]:
             errors.append("'description' contains shell metacharacters")
 
     return errors
+
+
+class ConfigManager:
+    """Read/write YAML host configuration files atomically.
+
+    Configuration is persisted as ``data/container_orch.yaml`` (by default)
+    with the schema documented at the top of this module.
+    """
+
+    def __init__(self, path: str | Path = "data/container_orch.yaml") -> None:
+        self.path = Path(path)
+
+    # ── internal helpers ──────────────────────────────────────────────────
+
+    def _ensure_config(self) -> dict:
+        """Load and return the parsed config dict.
+
+        If the file does not exist, create it with ``{"hosts": []}`` and
+        return that default.
+        """
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+                if "hosts" not in data:
+                    data["hosts"] = []
+                return data
+        except FileNotFoundError:
+            self._write({"hosts": []})
+            return {"hosts": []}
+
+    def _write(self, data: dict) -> None:
+        """Atomically write *data* to the YAML file.
+
+        Writes to a ``.tmp`` sibling first, fsyncs, then ``os.rename`` into
+        place so a crash mid-write never leaves a truncated file.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f"{self.path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp, str(self.path))
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def load(self) -> dict:
+        """Parse YAML, validate every host entry, and return the config dict.
+
+        Raises ``ValueError`` if any host fails validation.
+        """
+        data = self._ensure_config()
+        hosts = data.get("hosts", [])
+        if not isinstance(hosts, list):
+            raise ValueError("'hosts' must be a list")
+        for entry in hosts:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"Each host must be a dictionary, got {type(entry).__name__}"
+                )
+            errors = validate_host_config(entry)
+            if errors:
+                raise ValueError(
+                    f"Validation failed for host '{entry.get('name', '?')}': "
+                    f"{'; '.join(errors)}"
+                )
+        return data
+
+    def save(self, hosts: list[dict]) -> None:
+        for entry in hosts:
+            errors = validate_host_config(entry)
+            if errors:
+                raise ValueError(
+                    f"Validation failed for host '{entry.get('name', '?')}': "
+                    f"{'; '.join(errors)}"
+                )
+        self._write({"hosts": hosts})
+
+    def add_host(
+        self,
+        name: str,
+        host: str,
+        port: int,
+        user: str,
+        key_path: str | None = None,
+        opencode_port: int = 4096,
+        local_tunnel_port: int | None = None,
+        description: str = "",
+    ) -> None:
+        """Validate and add a new host entry, then persist.
+
+        Defaults
+        --------
+        * ``key_path`` → ``data/ssh/id_ed25519`` when omitted.
+        * ``local_tunnel_port`` → auto-assigned as ``14096 + current_host_count``
+          when omitted (so the first host gets 14096, the second 14097, …).
+        """
+        if key_path is None:
+            key_path = "data/ssh/id_ed25519"
+        if local_tunnel_port is None:
+            existing = self.list_hosts()
+            local_tunnel_port = 14096 + len(existing)
+
+        config: dict[str, Any] = {
+            "name": name,
+            "host": host,
+            "port": port,
+            "user": user,
+            "key_path": key_path,
+            "opencode_port": opencode_port,
+            "local_tunnel_port": local_tunnel_port,
+            "description": description,
+        }
+
+        errors = validate_host_config(config)
+        if errors:
+            raise ValueError(f"Invalid host config: {'; '.join(errors)}")
+
+        existing = self.list_hosts()
+        if any(h.get("name") == name for h in existing):
+            raise ValueError(f"Host '{name}' already exists")
+
+        existing.append(config)
+        self.save(existing)
+
+    def remove_host(self, name: str) -> bool:
+        """Remove a host by *name*.
+
+        Returns ``True`` if the host was found and removed, ``False`` if no
+        host with that name existed.
+        """
+        hosts = self.list_hosts()
+        filtered = [h for h in hosts if h.get("name") != name]
+        if len(filtered) == len(hosts):
+            return False
+        self.save(filtered)
+        return True
+
+    def list_hosts(self) -> list[dict]:
+        return self._ensure_config().get("hosts", [])
+
+    def get_host(self, name: str) -> dict | None:
+        for host in self.list_hosts():
+            if host.get("name") == name:
+                return host
+        return None

@@ -1,0 +1,16 @@
+ConfigManager QA: PASS
+Tests: 14/14 passed
+  [OK] auto-create
+  [OK] default-key
+  [OK] default-port
+  [OK] two-hosts
+  [OK] custom-key
+  [OK] port-increment
+  [OK] get-host-found
+  [OK] get-host-none
+  [OK] remove-existing
+  [OK] remove-nonexistent
+  [OK] remove-count
+  [OK] duplicate-reject
+  [OK] validation-reject
+  [OK] load-validation
