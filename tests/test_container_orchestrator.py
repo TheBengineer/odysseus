@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import yaml
@@ -40,6 +41,7 @@ sys.modules[MODNAME] = _orch
 _spec.loader.exec_module(_orch)
 
 ConfigManager = _orch.ConfigManager
+SshManager = _orch.SshManager
 validate_host_config = _orch.validate_host_config
 
 
@@ -492,3 +494,324 @@ class TestEdgeCases:
         hosts = cm.list_hosts()
         assert len(hosts) == 2
         assert hosts[1]["name"] == "ext"
+
+
+# ── SshManager tests ─────────────────────────────────────────────────────────────
+
+
+class TestSshManager:
+    """Mocked-subprocess tests for SSH tunnel lifecycle.
+
+    All ``asyncio.create_subprocess_exec`` and network calls are mocked —
+    no actual SSH connections are ever established.
+    """
+
+    _A_VALID_CONFIG: dict = {
+        "name": "dev-box",
+        "host": "192.168.1.100",
+        "port": 22,
+        "user": "dev",
+        "key_path": "data/ssh/id_ed25519",
+        "opencode_port": 4096,
+        "local_tunnel_port": 14096,
+        "description": "Development server",
+    }
+
+    # ── fixtures ────────────────────────────────────────────────────────────────
+
+    @pytest.fixture
+    def ssh(self, tmp_path: Path) -> SshManager:
+        """Return an ``SshManager`` backed by a temp config directory."""
+        return SshManager(config_dir=str(tmp_path / "ssh"))
+
+    @pytest.fixture
+    def mock_proc(self) -> AsyncMock:
+        """Return a mock subprocess ``Process`` that appears alive.
+
+        ``returncode`` is ``None`` (still running), ``communicate`` returns
+        empty bytes, ``wait`` returns 0 immediately, and ``send_signal``
+        is a no-op.
+        """
+        proc = AsyncMock()
+        proc.returncode = None
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.wait = AsyncMock(return_value=0)
+        proc.send_signal = Mock()
+        proc.pid = 12345
+        return proc
+
+    @pytest.fixture
+    def happy_path_mocks(
+        self, ssh: SshManager, mock_proc: AsyncMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[AsyncMock, AsyncMock, AsyncMock]:
+        """Patch ``asyncio.create_subprocess_exec`` and internal tunnel/OpenCode
+        checks so a ``connect()`` call succeeds immediately.
+
+        Returns ``(mock_create_subprocess_exec, mock_wait_for_tunnel,
+        mock_check_opencode)`` for further per-test overrides.
+        """
+        mock_create = AsyncMock(return_value=mock_proc)
+        monkeypatch.setattr("asyncio.create_subprocess_exec", mock_create)
+
+        mock_tunnel = AsyncMock(return_value=True)
+        monkeypatch.setattr(ssh, "_wait_for_tunnel", mock_tunnel)
+
+        mock_opencode = AsyncMock(return_value=True)
+        monkeypatch.setattr(ssh, "_check_opencode_ready", mock_opencode)
+
+        return mock_create, mock_tunnel, mock_opencode
+
+    # ── connect — command construction ─────────────────────────────────────────
+
+    async def test_build_command(
+        self, ssh: SshManager, happy_path_mocks: tuple,
+    ) -> None:
+        """``connect`` builds an SSH command with all expected flags."""
+        mock_create, _, _ = happy_path_mocks
+
+        await ssh.connect(self._A_VALID_CONFIG)
+
+        mock_create.assert_called_once()
+        cmd = mock_create.call_args[0]  # positional args
+
+        assert cmd[0] == "ssh"
+        assert "-N" in cmd
+        assert "-L" in cmd
+        port_arg = "127.0.0.1:14096:127.0.0.1:4096"
+        assert any(port_arg in arg for arg in cmd)
+        assert "-i" in cmd
+        assert "data/ssh/id_ed25519" in cmd
+        assert "-p" in cmd
+        assert "22" in cmd
+        assert "dev@192.168.1.100" in cmd
+        assert any("StrictHostKeyChecking=accept-new" in arg for arg in cmd)
+        # All arguments are plain strings (no nested lists)
+        assert all(isinstance(a, str) for a in cmd)
+
+    async def test_connect_with_auth_key(
+        self, ssh: SshManager, happy_path_mocks: tuple,
+    ) -> None:
+        """``connect`` passes ``-i`` with the custom key path when provided."""
+        mock_create, _, _ = happy_path_mocks
+        config = {**self._A_VALID_CONFIG, "key_path": "data/ssh/custom_ed25519"}
+
+        await ssh.connect(config)
+
+        cmd = mock_create.call_args[0]
+        i_idx = cmd.index("-i")
+        assert cmd[i_idx + 1] == "data/ssh/custom_ed25519"
+
+    # ── connect — success path ─────────────────────────────────────────────────
+
+    async def test_connect(
+        self, ssh: SshManager, happy_path_mocks: tuple,
+    ) -> None:
+        """``connect`` returns ``success=True`` when the tunnel and OpenCode
+        verification both pass."""
+        result = await ssh.connect(self._A_VALID_CONFIG)
+
+        assert result["success"] is True
+        assert result["name"] == "dev-box"
+        assert result["local_port"] == 14096
+        # Connection is tracked in _connections
+        assert "dev-box" in ssh._connections
+
+    async def test_connect_duplicate(
+        self, ssh: SshManager, happy_path_mocks: tuple,
+    ) -> None:
+        """``connect`` rejects a duplicate connection name."""
+        await ssh.connect(self._A_VALID_CONFIG)
+        result = await ssh.connect(self._A_VALID_CONFIG)
+
+        assert result["success"] is False
+        assert "already exists" in result["message"]
+
+    # ── connect — failure paths ────────────────────────────────────────────────
+
+    async def test_connect_no_opencode(
+        self, ssh: SshManager, mock_proc: AsyncMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``connect`` fails when the tunnel is up but OpenCode does not respond."""
+        monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc))
+        monkeypatch.setattr(ssh, "_wait_for_tunnel", AsyncMock(return_value=True))
+        monkeypatch.setattr(ssh, "_check_opencode_ready", AsyncMock(return_value=False))
+
+        result = await ssh.connect(self._A_VALID_CONFIG)
+
+        assert result["success"] is False
+        assert "OpenCode did not respond" in result["message"]
+        # Connection is cleaned up on failure
+        assert "dev-box" not in ssh._connections
+
+    async def test_connect_refused(
+        self, ssh: SshManager, mock_proc: AsyncMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``connect`` reports a user-friendly message on SSH connection refused."""
+        mock_proc.communicate = AsyncMock(
+            return_value=(
+                b"",
+                b"ssh: connect to host 192.168.1.100 port 22: Connection refused",
+            ),
+        )
+        monkeypatch.setattr("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc))
+        monkeypatch.setattr(ssh, "_wait_for_tunnel", AsyncMock(return_value=False))
+
+        result = await ssh.connect(self._A_VALID_CONFIG)
+
+        assert result["success"] is False
+        assert "connection refused" in result["message"].lower()
+        assert "dev-box" not in ssh._connections
+
+    # ── injection prevention ───────────────────────────────────────────────────
+
+    async def test_injection_prevention(
+        self, ssh: SshManager, happy_path_mocks: tuple,
+    ) -> None:
+        """Shell metacharacters in config are caught by validation — subprocess
+        is never invoked with malicious values."""
+        mock_create, _, _ = happy_path_mocks
+
+        malicious = {
+            **self._A_VALID_CONFIG,
+            "host": "192.168.1.100; rm -rf /",
+            "user": "dev$(whoami)",
+        }
+        result = await ssh.connect(malicious)
+
+        # Validation rejects shell metacharacters BEFORE subprocess exec
+        assert result["success"] is False
+        assert "Invalid config" in result["message"]
+        mock_create.assert_not_called()
+
+    # ── sanitize_for_subprocess (defence-in-depth) ─────────────────────────────
+
+    def test_sanitize_removes_shell_meta(self) -> None:
+        """``sanitize_for_subprocess`` strips shell metacharacters."""
+        assert _orch.sanitize_for_subprocess("foo;bar") == "foobar"
+        assert _orch.sanitize_for_subprocess("foo$(bar)") == "foobar"
+        assert _orch.sanitize_for_subprocess("foo|bar") == "foobar"
+        assert _orch.sanitize_for_subprocess("normal") == "normal"
+        assert _orch.sanitize_for_subprocess("") == ""
+
+    # ── disconnect ─────────────────────────────────────────────────────────────
+
+    async def test_disconnect(
+        self, ssh: SshManager, mock_proc: AsyncMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``disconnect`` kills the SSH process and removes the connection."""
+        ssh._connections["dev-box"] = {
+            "process": mock_proc,
+            "local_port": 14096,
+            "host": "192.168.1.100",
+            "user": "dev",
+            "opencode_port": 4096,
+        }
+        monkeypatch.setattr(ssh, "_wait_for_port_free", AsyncMock(return_value=True))
+
+        result = await ssh.disconnect("dev-box")
+
+        assert result is True
+        mock_proc.send_signal.assert_called_once_with(_orch.signal.SIGTERM)
+        assert "dev-box" not in ssh._connections
+
+    async def test_disconnect_not_found(
+        self, ssh: SshManager,
+    ) -> None:
+        """``disconnect`` returns ``False`` for an unknown host."""
+        result = await ssh.disconnect("ghost")
+        assert result is False
+
+    async def test_disconnect_all(
+        self, ssh: SshManager, mock_proc: AsyncMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``disconnect_all`` terminates every active tunnel and clears state."""
+        proc_a = mock_proc
+        proc_b = AsyncMock()
+        proc_b.returncode = None
+        proc_b.communicate = AsyncMock(return_value=(b"", b""))
+        proc_b.wait = AsyncMock(return_value=0)
+        proc_b.send_signal = Mock()
+        proc_b.pid = 23456
+
+        ssh._connections["host-a"] = {
+            "process": proc_a, "local_port": 14096,
+        }
+        ssh._connections["host-b"] = {
+            "process": proc_b, "local_port": 14097,
+        }
+        monkeypatch.setattr(ssh, "_wait_for_port_free", AsyncMock(return_value=True))
+
+        await ssh.disconnect_all()
+
+        assert ssh._connections == {}
+        proc_a.send_signal.assert_called_once_with(_orch.signal.SIGTERM)
+        proc_b.send_signal.assert_called_once_with(_orch.signal.SIGTERM)
+
+    # ── status ─────────────────────────────────────────────────────────────────
+
+    async def test_status_connected(
+        self, ssh: SshManager, mock_proc: AsyncMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``status`` reports connected when the process is alive and port open."""
+        ssh._connections["dev-box"] = {
+            "process": mock_proc,
+            "local_port": 14096,
+            "host": "192.168.1.100",
+            "user": "dev",
+            "opencode_port": 4096,
+        }
+        monkeypatch.setattr(ssh, "_is_port_listening", AsyncMock(return_value=True))
+
+        state = await ssh.status("dev-box")
+
+        assert state["connected"] is True
+        assert state["process_alive"] is True
+        assert state["port_open"] is True
+
+    async def test_status_disconnected(
+        self, ssh: SshManager, mock_proc: AsyncMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``status`` reports disconnected when the process has exited."""
+        mock_proc.returncode = 0  # process exited
+        ssh._connections["dev-box"] = {
+            "process": mock_proc,
+            "local_port": 14096,
+            "host": "192.168.1.100",
+            "user": "dev",
+            "opencode_port": 4096,
+        }
+        monkeypatch.setattr(ssh, "_is_port_listening", AsyncMock(return_value=False))
+
+        state = await ssh.status("dev-box")
+
+        assert state["connected"] is False
+        assert state["process_alive"] is False
+        assert state["port_open"] is False
+
+    async def test_status_not_found(
+        self, ssh: SshManager,
+    ) -> None:
+        """``status`` returns not-found for an unknown host."""
+        state = await ssh.status("ghost")
+        assert state["connected"] is False
+        assert state["error"] == "not found"
+
+    # ── _wait_for_tunnel ───────────────────────────────────────────────────────
+
+    async def test_wait_for_tunnel_success(
+        self, ssh: SshManager, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``_wait_for_tunnel`` returns ``True`` when the port is detected immediately."""
+        monkeypatch.setattr(ssh, "_is_port_listening", AsyncMock(return_value=True))
+
+        ok = await ssh._wait_for_tunnel(local_port=14096, timeout=1)
+        assert ok is True
+
+    async def test_wait_for_tunnel_timeout(
+        self, ssh: SshManager, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``_wait_for_tunnel`` returns ``False`` when the port never appears."""
+        monkeypatch.setattr(ssh, "_is_port_listening", AsyncMock(return_value=False))
+
+        ok = await ssh._wait_for_tunnel(local_port=14096, timeout=0.1)
+        assert ok is False
