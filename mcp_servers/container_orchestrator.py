@@ -41,6 +41,7 @@ import httpx
 import yaml
 
 from mcp.server import Server
+from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 __all__: list[str] = [
@@ -1589,3 +1590,22 @@ async def _handle_stop_session(arguments: dict) -> list[TextContent]:
         type="text",
         text=f"Failed to cancel session '{session_id}'.",
     )]
+
+
+# ── Main entry point ────────────────────────────────────────────────────────────
+
+
+async def run() -> None:
+    """Run the container orchestrator MCP server over stdio.
+
+    Uses ``stdio_server()`` for stdin/stdout transport so the server
+    works as a subprocess or piped MCP tool.
+    """
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream, write_stream, server.create_initialization_options()
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

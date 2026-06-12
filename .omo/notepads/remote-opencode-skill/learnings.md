@@ -45,3 +45,14 @@ Added three stdlib dataclass types to `mcp_servers/container_orchestrator.py`:
 - **`SessionInfo`**: Remote session metadata. Fields: `session_id`, `title`, `created_at`, `status` (active|completed|failed).
 - All types use `@dataclass` (stdlib, not pydantic) and are JSON-serializable via `dataclasses.asdict()`.
 - `from __future__ import annotations` enables `int | None` syntax on `local_tunnel_port`.
+
+## Task 11 - MCP server main entry point (container_orchestrator.py)
+
+- Added `from mcp.server.stdio import stdio_server` import
+- Added `async def run()` using `stdio_server()` context manager + `server.run()` with `create_initialization_options()`
+- Added `if __name__ == "__main__": asyncio.run(run())` entry point
+- Verified server starts standalone (timeout exit code 124 = blocking on stdio = correct)
+- Pattern matches `email_server.py` lines 2189-2197 exactly
+- Unknown tool name handling already existed in `call_tool` (else clause returning `Error: Unknown tool: {name}` as TextContent)
+- Global try/except already wrapped `call_tool` dispatch
+- No modification needed to existing 10 tool definitions or handlers
