@@ -24,6 +24,7 @@ Config schema (data/container_orch.yaml):
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -36,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
 
 __all__: list[str] = [
@@ -47,6 +49,8 @@ __all__: list[str] = [
     'validate_host_config',
     'ConfigManager',
     'SshManager',
+    'OpencodeError',
+    'OpencodeClient',
 ]
 
 # ── Input validation ──────────────────────────────────────────────────────────
@@ -651,3 +655,203 @@ class SshManager:
             except ProcessLookupError:
                 pass
             await proc.wait()
+
+
+class OpencodeError(Exception):
+    """Raised when an OpenCode API request fails at the HTTP or transport layer.
+
+    Carries a human-readable ``message`` and the originating exception as
+    ``__cause__`` when applicable.
+    """
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class OpencodeClient:
+    """HTTP client for a remote OpenCode *serve* instance.
+
+    Communicates with an OpenCode server exposed via SSH tunnel or direct
+    network access.  All public methods are async and use ``httpx`` under
+    the hood.
+
+    Parameters
+    ----------
+    base_url : str
+        Root URL of the remote OpenCode instance, e.g. ``http://127.0.0.1:14096``.
+    password : str | None
+        Password for ``Authorization: Basic`` header.  Sent as
+        ``opencode:<password>`` base64-encoded.  When ``None``, no auth header
+        is added.
+    """
+
+    def __init__(self, base_url: str, password: str | None = None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self._password = password
+        self._auth_header: dict[str, str] = {}
+        if password:
+            encoded = base64.b64encode(f"opencode:{password}".encode()).decode()
+            self._auth_header = {"Authorization": f"Basic {encoded}"}
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    async def health(self) -> bool:
+        """Return ``True`` if the remote OpenCode instance is reachable.
+
+        Sends ``GET /doc`` and asserts the response status is 200.
+        """
+        try:
+            async with self._client() as client:
+                resp = await client.get("/doc", timeout=httpx.Timeout(10.0, connect=10.0))
+                return resp.status_code == 200
+        except httpx.ConnectError:
+            return False
+        except httpx.TimeoutException:
+            return False
+
+    async def list_sessions(self) -> list[dict]:
+        """Return all active sessions from the remote instance.
+
+        Returns
+        -------
+        list[dict]
+            List of session dictionaries, or a list containing a single
+            ``{"error": "..."}`` dict on failure.
+        """
+        return await self._request("GET", "/sessions")
+
+    async def create_session(self, title: str, project: str) -> dict:
+        """Create a new session on the remote instance.
+
+        Parameters
+        ----------
+        title : str
+            Session title.
+        project : str
+            Project path the session belongs to.
+
+        Returns
+        -------
+        dict
+            The created session object, or ``{"error": "..."}`` on failure.
+        """
+        return await self._request("POST", "/sessions", json={"title": title, "project": project})
+
+    async def send_prompt(self, session_id: str, text: str) -> str:
+        """Send a prompt to an existing session and return the response text.
+
+        Parameters
+        ----------
+        session_id : str
+            ID of the target session.
+        text : str
+            Prompt text to send.
+
+        Returns
+        -------
+        str
+            The response body as a string, or a JSON string
+            ``{"error": "..."}`` on failure.
+        """
+        try:
+            async with self._client() as client:
+                url = f"/sessions/{session_id}/prompt"
+                resp = await client.post(
+                    url,
+                    json={"text": text},
+                    headers=self._auth_header,
+                    timeout=httpx.Timeout(120.0, connect=10.0),
+                )
+                resp.raise_for_status()
+                return resp.text
+        except httpx.ConnectError:
+            return '{"error": "Connection refused — is the remote OpenCode running?"}'
+        except httpx.TimeoutException:
+            return '{"error": "Request timed out"}'
+        except httpx.HTTPStatusError as exc:
+            return self._handle_http_error(exc)
+
+    async def stop_session(self, session_id: str) -> bool:
+        """Cancel a running prompt on the remote session.
+
+        Returns ``True`` if the cancellation was accepted (HTTP 2xx).
+        """
+        result = await self._request("POST", f"/sessions/{session_id}/cancel")
+        if isinstance(result, dict) and "error" in result:
+            return False
+        return True
+
+    async def get_session(self, session_id: str) -> dict:
+        """Retrieve a single session by ID.
+
+        Returns
+        -------
+        dict
+            The session object, or ``{"error": "..."}`` on failure.
+        """
+        return await self._request("GET", f"/sessions/{session_id}")
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _client(self) -> httpx.AsyncClient:
+        """Return an ``httpx.AsyncClient`` configured with auth headers."""
+        return httpx.AsyncClient(base_url=self.base_url, headers=self._auth_header)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Low-level HTTP request helper with consistent error handling.
+
+        Parameters
+        ----------
+        method : str
+            HTTP method (``GET``, ``POST``, …).
+        path : str
+            URL path relative to ``base_url``.
+        **kwargs
+            Extra arguments forwarded to ``httpx.AsyncClient.request``.
+
+        Returns
+        -------
+        Any
+            Parsed JSON response, or ``{"error": "..."}`` on failure.
+        """
+        try:
+            async with self._client() as client:
+                # Set a sensible default timeout if not overridden
+                kwargs.setdefault("timeout", httpx.Timeout(30.0, connect=10.0))
+                resp = await client.request(method, path, **kwargs)
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.ConnectError:
+            return {"error": "Connection refused — is the remote OpenCode running?"}
+        except httpx.TimeoutException:
+            return {"error": "Request timed out"}
+        except httpx.HTTPStatusError as exc:
+            return self._handle_http_error(exc)
+
+    def _handle_http_error(self, exc: httpx.HTTPStatusError) -> dict:
+        """Map HTTP status codes to user-facing error messages.
+
+        Parameters
+        ----------
+        exc : httpx.HTTPStatusError
+            The caught HTTP error with ``response`` and ``request``.
+
+        Returns
+        -------
+        dict
+            An ``{"error": "..."}`` dict appropriate for the status code.
+        """
+        status = exc.response.status_code
+        if status in (401, 403):
+            return {"error": "Authentication failed — check password"}
+        if status == 404:
+            return {"error": "Session not found"}
+        if status >= 500:
+            return {"error": f"Remote server error (HTTP {status})"}
+        return {"error": f"HTTP {status}: {exc.response.text[:200]}"}

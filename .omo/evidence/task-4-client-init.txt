@@ -1,0 +1,13 @@
+{
+  "status": "PASS",
+  "tests": 6,
+  "passed": 6,
+  "results": {
+    "init": true,
+    "auth-set": true,
+    "auth-format": true,
+    "no-auth": true,
+    "client-type": true,
+    "strip-slash": true
+  }
+}
