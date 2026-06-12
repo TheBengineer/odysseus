@@ -133,6 +133,17 @@ def _get_connected() -> set[str]:
     return _connected_hosts
 
 
+#: Lazy-initialized SSH tunnel manager.
+_ssh_manager: SshManager | None = None
+
+
+def _get_ssh_manager() -> SshManager:
+    global _ssh_manager
+    if _ssh_manager is None:
+        _ssh_manager = SshManager(config_dir="data/ssh")
+    return _ssh_manager
+
+
 # ── Input validation ──────────────────────────────────────────────────────────
 
 # Shell metacharacters that must be rejected in most inputs
@@ -1021,6 +1032,62 @@ async def list_tools() -> list[Tool]:
                 "required": ["name"],
             },
         ),
+        Tool(
+            name="container_orch_connect",
+            description=(
+                "Establish an SSH tunnel to a configured remote OpenCode host. "
+                "Starts an SSH tunnel, waits for it to become live, and verifies "
+                "that OpenCode responds on the tunneled port. "
+                "The host must be configured via container_orch_add_host first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the configured host to connect to",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="container_orch_disconnect",
+            description=(
+                "Tear down an active SSH tunnel to a remote OpenCode host. "
+                "Kills the SSH process and frees the local tunnel port. "
+                "Safe to call even if the host is not currently connected."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the connected host to disconnect",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="container_orch_status",
+            description=(
+                "Check the current connection state of a remote OpenCode host. "
+                "Returns whether the SSH tunnel is active, the local and remote "
+                "port mapping, and the host address. "
+                "Use this to verify connectivity before sending commands."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the host to check",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
     ]
 
 
@@ -1034,6 +1101,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _handle_add_host(arguments)
         elif name == "container_orch_remove_host":
             return _handle_remove_host(arguments)
+        elif name == "container_orch_connect":
+            return await _handle_connect(arguments)
+        elif name == "container_orch_disconnect":
+            return await _handle_disconnect(arguments)
+        elif name == "container_orch_status":
+            return await _handle_status(arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as exc:
@@ -1136,3 +1209,102 @@ def _handle_remove_host(arguments: dict) -> list[TextContent]:
     if removed:
         return [TextContent(type="text", text=f"Host '{name}' removed successfully")]
     return [TextContent(type="text", text=f"Host '{name}' not found")]
+
+
+async def _handle_connect(arguments: dict) -> list[TextContent]:
+    """Establish an SSH tunnel to a configured host."""
+    name = arguments.get("name")
+    if not name:
+        return [TextContent(type="text", text="Error: 'name' is required")]
+
+    # Look up host config
+    try:
+        config = _get_config().get_host(name)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Failed to read configuration: {exc}")]
+
+    if config is None:
+        return [TextContent(
+            type="text",
+            text=f"Host '{name}' not found in configuration",
+        )]
+
+    # Check not already connected
+    if name in _get_connected():
+        return [TextContent(
+            type="text",
+            text=f"Host '{name}' is already connected. Disconnect it first.",
+        )]
+
+    # Establish the tunnel
+    try:
+        ssh = _get_ssh_manager()
+        result = await ssh.connect(config)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Connection failed: {exc}")]
+
+    if result.get("success"):
+        _get_connected().add(name)
+        return [TextContent(type="text", text=result.get("message", f"Connected to '{name}'"))]
+
+    return [TextContent(type="text", text=result.get("message", f"Failed to connect to '{name}'"))]
+
+
+async def _handle_disconnect(arguments: dict) -> list[TextContent]:
+    """Tear down an active SSH tunnel."""
+    name = arguments.get("name")
+    if not name:
+        return [TextContent(type="text", text="Error: 'name' is required")]
+
+    if name not in _get_connected():
+        return [TextContent(
+            type="text",
+            text=f"Host '{name}' is not currently connected.",
+        )]
+
+    try:
+        ssh = _get_ssh_manager()
+        ok = await ssh.disconnect(name)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Disconnect failed: {exc}")]
+
+    _get_connected().discard(name)
+
+    if ok:
+        return [TextContent(type="text", text=f"Disconnected from '{name}'")]
+    return [TextContent(type="text", text=f"Host '{name}' was not tracked by the SSH manager")]
+
+
+async def _handle_status(arguments: dict) -> list[TextContent]:
+    """Report the connection state of a host."""
+    name = arguments.get("name")
+    if not name:
+        return [TextContent(type="text", text="Error: 'name' is required")]
+
+    try:
+        ssh = _get_ssh_manager()
+        state = await ssh.status(name)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Status check failed: {exc}")]
+
+    if not state.get("connected"):
+        if state.get("error") == "not found":
+            return [TextContent(type="text", text=f"Host '{name}': no active connection found")]
+        return [TextContent(
+            type="text",
+            text=(
+                f"Host '{name}': disconnected\n"
+                f"  Process alive: {state.get('process_alive', '?')}\n"
+                f"  Port open: {state.get('port_open', '?')}"
+            ),
+        )]
+
+    return [TextContent(
+        type="text",
+        text=(
+            f"Host '{name}': connected\n"
+            f"  Local port: {state.get('local_port', '?')}\n"
+            f"  Remote host: {state.get('host', '?')}:{state.get('remote_port', '?')}\n"
+            f"  SSH user: {state.get('user', '?')}"
+        ),
+    )]
