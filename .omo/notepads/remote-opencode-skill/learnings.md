@@ -56,3 +56,25 @@ Added three stdlib dataclass types to `mcp_servers/container_orchestrator.py`:
 - Unknown tool name handling already existed in `call_tool` (else clause returning `Error: Unknown tool: {name}` as TextContent)
 - Global try/except already wrapped `call_tool` dispatch
 - No modification needed to existing 10 tool definitions or handlers
+
+## SKILL.md Creation (2026-06-12)
+
+Created `data/skills/system/container-orchestrator/SKILL.md`:
+
+- **Frontmatter**: name, description, version (1.0.0), category (system), tags (remote/container/ssh/opencode/deploy/orchestration), platforms (linux), requires_toolsets (mcp), status (published), confidence (0.9), source (taught), created ISO timestamp, when_to_use (trigger keywords), procedure (7 steps), pitfalls (4 items), verification (3 items)
+- **Body sections**: Overview, When to Use, Quick Start, Procedure, Tools Reference, Security Best Practices, Troubleshooting, Pitfalls, Verification
+- **10 tools documented**: container_orch_list_hosts, container_orch_add_host, container_orch_remove_host, container_orch_connect, container_orch_disconnect, container_orch_status, container_orch_create_session, container_orch_send_prompt, container_orch_list_sessions, container_orch_stop_session
+- Verified parseable by custom YAML frontmatter parser in `skill_format.py`
+
+## OpencodeClient Unit Tests (2026-06-12)
+
+Added `TestOpencodeClient` class (19 tests) to `tests/test_container_orchestrator.py`:
+
+- **Mocking strategy**: Uses `patch.object(_orch.httpx, "AsyncClient")` with `autouse` fixture so **no test ever connects to a real server**. The fixture also yields the inner async-context-manager instance for per-test configuration.
+- **Key patterns discovered**:
+  - `_request()` calls `resp.json()` **synchronously** (no `await`) — so `json` on response mocks must be `Mock(return_value=...)`, **not** `AsyncMock`.
+  - `send_prompt()` calls `resp.raise_for_status()` **synchronously** — same constraint: use `Mock` (not `AsyncMock`) for response mocks.
+  - `httpx.Response(status_code=N)` without `request=` raises `RuntimeError` in httpx ≥0.28. Always pass `request=httpx.Request("METHOD", "http://...")` when testing via real `httpx.Response` objects.
+  - `httpx.ConnectError` and `httpx.TimeoutException` can be used as `side_effect` directly on any mock attribute.
+- **Coverage**: All 6 public methods (`health`, `create_session`, `send_prompt`, `list_sessions`, `stop_session`, `get_session`) plus error paths (ConnectError, TimeoutException, 401, 404, 5xx) and auth header construction.
+- **Result**: 19/19 tests pass, 0 warnings, no real connections.
