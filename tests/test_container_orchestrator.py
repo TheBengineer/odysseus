@@ -18,10 +18,13 @@ Schema reference (data/container_orch.yaml):
 
 from __future__ import annotations
 
+import base64
+import json
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
+import httpx
 import pytest
 import yaml
 
@@ -41,6 +44,8 @@ sys.modules[MODNAME] = _orch
 _spec.loader.exec_module(_orch)
 
 ConfigManager = _orch.ConfigManager
+OpencodeClient = _orch.OpencodeClient
+OpencodeError = _orch.OpencodeError
 SshManager = _orch.SshManager
 validate_host_config = _orch.validate_host_config
 
@@ -815,3 +820,251 @@ class TestSshManager:
 
         ok = await ssh._wait_for_tunnel(local_port=14096, timeout=0.1)
         assert ok is False
+
+
+# ── OpencodeClient tests ─────────────────────────────────────────────────────────
+
+
+class TestOpencodeClient:
+    """Mocked HTTP tests for ``OpencodeClient``.
+
+    All ``httpx.AsyncClient`` calls are mocked — no real network
+    connections are ever made.
+    """
+
+    @pytest.fixture
+    def client(self) -> OpencodeClient:
+        """Return an ``OpencodeClient`` pointing at a local tunnel (no auth)."""
+        return OpencodeClient(base_url="http://127.0.0.1:14096")
+
+    @pytest.fixture
+    def authed_client(self) -> OpencodeClient:
+        """Return a client with a password for auth header tests."""
+        return OpencodeClient(base_url="http://127.0.0.1:14096", password="secret123")
+
+    @pytest.fixture(autouse=True)
+    def mock_httpx_client(self) -> AsyncMock:
+        """Patch ``_orch.httpx.AsyncClient`` — connections are never real.
+
+        Returns the mock *instance* (what the ``async with`` block yields)
+        so each test can configure ``request``, ``get``, ``post``, etc.
+        """
+        with patch.object(_orch.httpx, "AsyncClient") as mock_cls:
+            instance = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = instance
+            yield instance
+
+    # ── Auth header ─────────────────────────────────────────────────────────────
+
+    def test_auth_header(self) -> None:
+        """``Authorization`` header is ``Basic base64(opencode:password)``."""
+        client = OpencodeClient("http://127.0.0.1:14096", password="hunter2")
+        expected = base64.b64encode(b"opencode:hunter2").decode()
+        assert client._auth_header == {"Authorization": f"Basic {expected}"}
+
+    def test_no_auth_header(self) -> None:
+        """When password is ``None``, no auth header is set."""
+        client = OpencodeClient("http://127.0.0.1:14096")
+        assert client._auth_header == {}
+
+    # ── health ──────────────────────────────────────────────────────────────────
+
+    async def test_health_success(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``GET /doc`` with 200 returns ``True``."""
+        mock_httpx_client.get.return_value = Mock(status_code=200)
+        assert await client.health() is True
+        mock_httpx_client.get.assert_called_once_with("/doc", timeout=ANY)
+
+    async def test_health_failure(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """Non-200 status returns ``False``."""
+        mock_httpx_client.get.return_value = Mock(status_code=500)
+        assert await client.health() is False
+
+    async def test_health_connection_refused(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``ConnectError`` from ``GET /doc`` returns ``False``."""
+        mock_httpx_client.get.side_effect = httpx.ConnectError("No connection")
+        assert await client.health() is False
+
+    async def test_health_timeout(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``TimeoutException`` from ``GET /doc`` returns ``False``."""
+        mock_httpx_client.get.side_effect = httpx.TimeoutException("Timed out")
+        assert await client.health() is False
+
+    # ── create_session ──────────────────────────────────────────────────────────
+
+    async def test_create_session(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``POST /sessions`` with title/project payload returns session data."""
+        expected = {"session_id": "sess_001", "title": "Test", "status": "active"}
+        mock_httpx_client.request.return_value = Mock(
+            status_code=200,
+            json=Mock(return_value=expected),
+        )
+        result = await client.create_session(title="Test", project="/my-project")
+        assert result == expected
+        mock_httpx_client.request.assert_called_once_with(
+            "POST", "/sessions",
+            json={"title": "Test", "project": "/my-project"},
+            timeout=ANY,
+        )
+
+    # ── send_prompt ─────────────────────────────────────────────────────────────
+
+    async def test_send_prompt(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``POST /sessions/{id}/prompt`` with text returns response string."""
+        expected = "Hello! How can I help?"
+        mock_httpx_client.post.return_value = Mock(
+            status_code=200,
+            text=expected,
+        )
+        result = await client.send_prompt(session_id="sess_001", text="Hi there")
+        assert result == expected
+        mock_httpx_client.post.assert_called_once()
+        args, kwargs = mock_httpx_client.post.call_args
+        assert args[0] == "/sessions/sess_001/prompt"
+        assert kwargs["json"] == {"text": "Hi there"}
+        assert kwargs["headers"] == {}
+
+    async def test_send_prompt_connection_refused(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``ConnectError`` during prompt returns error JSON string."""
+        mock_httpx_client.post.side_effect = httpx.ConnectError("No connection")
+        result = await client.send_prompt(session_id="sess_001", text="Hi")
+        assert json.loads(result) == {
+            "error": "Connection refused — is the remote OpenCode running?"
+        }
+
+    async def test_send_prompt_timeout(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``TimeoutException`` during prompt returns error JSON string."""
+        mock_httpx_client.post.side_effect = httpx.TimeoutException("Timed out")
+        result = await client.send_prompt(session_id="sess_001", text="Hi")
+        assert json.loads(result) == {"error": "Request timed out"}
+
+    # ── list_sessions ───────────────────────────────────────────────────────────
+
+    async def test_list_sessions(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``GET /sessions`` returns a list of session dicts."""
+        expected = [
+            {"session_id": "sess_001", "title": "A", "status": "active"},
+            {"session_id": "sess_002", "title": "B", "status": "active"},
+        ]
+        mock_httpx_client.request.return_value = Mock(
+            status_code=200,
+            json=Mock(return_value=expected),
+        )
+        result = await client.list_sessions()
+        assert result == expected
+        mock_httpx_client.request.assert_called_once_with(
+            "GET", "/sessions", timeout=ANY,
+        )
+
+    # ── stop_session ────────────────────────────────────────────────────────────
+
+    async def test_stop_session(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``POST /sessions/{id}/cancel`` returns ``True`` on 2xx."""
+        mock_httpx_client.request.return_value = Mock(
+            status_code=200,
+            json=Mock(return_value={"result": "cancelled"}),
+        )
+        result = await client.stop_session(session_id="sess_001")
+        assert result is True
+        mock_httpx_client.request.assert_called_once_with(
+            "POST", "/sessions/sess_001/cancel", timeout=ANY,
+        )
+
+    async def test_stop_session_failure(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """When the API returns an error dict, ``stop_session`` returns ``False``."""
+        mock_httpx_client.request.return_value = Mock(
+            status_code=200,
+            json=Mock(return_value={"error": "already stopped"}),
+        )
+        result = await client.stop_session(session_id="sess_001")
+        assert result is False
+
+    # ── get_session ─────────────────────────────────────────────────────────────
+
+    async def test_get_session(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``GET /sessions/{id}`` returns the session dict."""
+        expected = {"session_id": "sess_001", "title": "My Session", "status": "active"}
+        mock_httpx_client.request.return_value = Mock(
+            status_code=200,
+            json=Mock(return_value=expected),
+        )
+        result = await client.get_session(session_id="sess_001")
+        assert result == expected
+        mock_httpx_client.request.assert_called_once_with(
+            "GET", "/sessions/sess_001", timeout=ANY,
+        )
+
+    # ── Error paths (via ``_request``) ──────────────────────────────────────────
+
+    async def test_connection_refused(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``ConnectError`` from ``_request`` returns error dict."""
+        mock_httpx_client.request.side_effect = httpx.ConnectError("No connection")
+        result = await client.list_sessions()
+        assert result == {"error": "Connection refused — is the remote OpenCode running?"}
+
+    async def test_timeout(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """``TimeoutException`` from ``_request`` returns error dict."""
+        mock_httpx_client.request.side_effect = httpx.TimeoutException("Timed out")
+        result = await client.list_sessions()
+        assert result == {"error": "Request timed out"}
+
+    async def test_auth_failure(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """401 response from ``_request`` returns auth error dict."""
+        mock_httpx_client.request.return_value = httpx.Response(
+            status_code=401,
+            request=httpx.Request("GET", "http://127.0.0.1:14096/"),
+        )
+        result = await client.list_sessions()
+        assert result == {"error": "Authentication failed — check password"}
+
+    async def test_session_not_found(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """404 response from ``_request`` returns not-found error dict."""
+        mock_httpx_client.request.return_value = httpx.Response(
+            status_code=404,
+            request=httpx.Request("GET", "http://127.0.0.1:14096/"),
+        )
+        result = await client.get_session(session_id="ghost")
+        assert result == {"error": "Session not found"}
+
+    async def test_server_error(
+        self, client: OpencodeClient, mock_httpx_client: AsyncMock,
+    ) -> None:
+        """500+ response from ``_request`` returns server-error dict."""
+        mock_httpx_client.request.return_value = httpx.Response(
+            status_code=502,
+            request=httpx.Request("GET", "http://127.0.0.1:14096/"),
+        )
+        result = await client.list_sessions()
+        assert result == {"error": "Remote server error (HTTP 502)"}
