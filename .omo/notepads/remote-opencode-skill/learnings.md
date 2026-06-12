@@ -35,3 +35,13 @@ Implemented `OpencodeClient` class in `mcp_servers/container_orchestrator.py`:
 ### References
 - SSH command pattern: `src/builtin_actions.py:339` (existing subprocess SSH usage)
 - Config defaults: `ConfigManager.add_host()` defaults for key_path and port assignment
+
+## Dataclass Types Added (2024-06-12)
+
+Added three stdlib dataclass types to `mcp_servers/container_orchestrator.py`:
+
+- **`HostConfig`**: Structured host configuration with `__post_init__` validation via `validate_host_config()`. Fields: `name`, `host`, `port`, `user`, `key_path` (default `data/ssh/id_ed25519`), `opencode_port` (4096), `local_tunnel_port` (None=auto-assign), `description`. Raises `ValueError` on invalid construction.
+- **`ConnectionState`**: SSH tunnel state tracking. Fields: `name`, `local_port`, `remote_host`, `pid`, `status` (connected|disconnected|error), `error_message`.
+- **`SessionInfo`**: Remote session metadata. Fields: `session_id`, `title`, `created_at`, `status` (active|completed|failed).
+- All types use `@dataclass` (stdlib, not pydantic) and are JSON-serializable via `dataclasses.asdict()`.
+- `from __future__ import annotations` enables `int | None` syntax on `local_tunnel_port`.

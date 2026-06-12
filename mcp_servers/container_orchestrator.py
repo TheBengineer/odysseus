@@ -51,7 +51,54 @@ __all__: list[str] = [
     'SshManager',
     'OpencodeError',
     'OpencodeClient',
+    'HostConfig',
+    'ConnectionState',
+    'SessionInfo',
 ]
+
+# ── Dataclass types ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class HostConfig:
+    name: str
+    host: str
+    port: int
+    user: str
+    key_path: str = "data/ssh/id_ed25519"
+    opencode_port: int = 4096
+    local_tunnel_port: int | None = None  # None = auto-assign
+    description: str = ""
+
+    def __post_init__(self):
+        errors = validate_host_config({
+            "name": self.name, "host": self.host, "port": self.port,
+            "user": self.user, "key_path": self.key_path,
+            "opencode_port": self.opencode_port,
+            "local_tunnel_port": self.local_tunnel_port,
+            "description": self.description,
+        })
+        if errors:
+            raise ValueError(f"Invalid HostConfig: {'; '.join(errors)}")
+
+
+@dataclass
+class ConnectionState:
+    name: str
+    local_port: int
+    remote_host: str
+    pid: int = 0
+    status: str = "disconnected"  # connected|disconnected|error
+    error_message: str = ""
+
+
+@dataclass
+class SessionInfo:
+    session_id: str
+    title: str = ""
+    created_at: str = ""
+    status: str = "active"  # active|completed|failed
+
 
 # ── Input validation ──────────────────────────────────────────────────────────
 

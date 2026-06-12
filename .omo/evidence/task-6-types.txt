@@ -1,0 +1,16 @@
+{
+  "status": "PASS",
+  "tests": 9,
+  "passed": 9,
+  "results": {
+    "hostconfig-valid": true,
+    "hostconfig-key-default": true,
+    "hostconfig-invalid": true,
+    "connstate": true,
+    "connstate-default-error": true,
+    "sessioninfo": true,
+    "json-serializable": true,
+    "json-name": true,
+    "custom-key": true
+  }
+}
