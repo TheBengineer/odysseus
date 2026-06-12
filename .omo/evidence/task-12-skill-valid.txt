@@ -1,0 +1,43 @@
+_passed: 8
+_status: PASS
+_total: 8
+category: system
+confidence: 0.9
+created: 2026-06-12 10:00:00+00:00
+description: Control OpenCode instances running in remote containers via SSH tunnels.
+name: container-orchestrator
+pitfalls:
+- Do not connect to hosts not in config. Always add a host first.
+- If connect fails, check SSH key path and remote host reachability.
+- Long-running prompts may time out. Set appropriate expectations.
+- Always disconnect after finishing to free up local ports.
+platforms:
+- linux
+procedure:
+- Call `container_orch_list_hosts` to see configured remote hosts.
+- If target host is not listed, call `container_orch_add_host` with name, host, port,
+  user, and key_path.
+- Call `container_orch_connect` with the host name to establish SSH tunnel.
+- Call `container_orch_status` to verify the connection is healthy.
+- Call `container_orch_create_session` with a title for the remote task.
+- Call `container_orch_send_prompt` with the session_id and your instructions.
+- When done, call `container_orch_disconnect` to clean up the tunnel.
+requires_toolsets:
+- mcp
+source: taught
+status: published
+tags:
+- remote
+- container
+- ssh
+- opencode
+- deploy
+- orchestration
+verification:
+- '`container_orch_list_hosts` returns configured hosts.'
+- '`container_orch_connect` establishes SSH tunnel on 127.0.0.1.'
+- '`container_orch_send_prompt` returns response from remote OpenCode.'
+version: 1.0.0
+when_to_use: User mentions remote server, container, SSH, deploy, cloud machine, VPS,
+  bare-metal server, remote dev, headless OpenCode, external host, or asks to run
+  code on another machine.
