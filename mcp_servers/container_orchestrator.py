@@ -133,6 +133,20 @@ def _get_connected() -> set[str]:
     return _connected_hosts
 
 
+#: Lazy-initialized dict mapping hostname → connection details (local_port).
+#: Populated by _handle_connect on successful tunnel creation, cleared by
+#: _handle_disconnect. Used by session-management handlers to reach the
+#: remote OpenCode API.
+_connection_info: dict[str, dict] | None = None
+
+
+def _get_connection_info() -> dict[str, dict]:
+    global _connection_info
+    if _connection_info is None:
+        _connection_info = {}
+    return _connection_info
+
+
 #: Lazy-initialized SSH tunnel manager.
 _ssh_manager: SshManager | None = None
 
@@ -1088,6 +1102,99 @@ async def list_tools() -> list[Tool]:
                 "required": ["name"],
             },
         ),
+        Tool(
+            name="container_orch_create_session",
+            description=(
+                "Create a new session on a connected remote OpenCode host. "
+                "The host must be connected via container_orch_connect first. "
+                "Returns the created session object with its session_id."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the connected remote host",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Title for the new session",
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project path the session belongs to",
+                    },
+                },
+                "required": ["name", "title", "project"],
+            },
+        ),
+        Tool(
+            name="container_orch_send_prompt",
+            description=(
+                "Send a prompt to an existing session on a connected remote "
+                "OpenCode host. The host must be connected via "
+                "container_orch_connect first. Use container_orch_create_session "
+                "to create a new session first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the connected remote host",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "ID of the session to send the prompt to",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Prompt text to send to the session",
+                    },
+                },
+                "required": ["name", "session_id", "text"],
+            },
+        ),
+        Tool(
+            name="container_orch_list_sessions",
+            description=(
+                "List all sessions on a connected remote OpenCode host. "
+                "The host must be connected via container_orch_connect first. "
+                "Returns each session's ID, title, status, and creation time."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the connected remote host",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="container_orch_stop_session",
+            description=(
+                "Cancel a running prompt on a remote OpenCode session. "
+                "The host must be connected via container_orch_connect first. "
+                "Use container_orch_list_sessions to find the session_id to stop."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the connected remote host",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "ID of the session to stop/cancel",
+                    },
+                },
+                "required": ["name", "session_id"],
+            },
+        ),
     ]
 
 
@@ -1107,6 +1214,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return await _handle_disconnect(arguments)
         elif name == "container_orch_status":
             return await _handle_status(arguments)
+        elif name == "container_orch_create_session":
+            return await _handle_create_session(arguments)
+        elif name == "container_orch_send_prompt":
+            return await _handle_send_prompt(arguments)
+        elif name == "container_orch_list_sessions":
+            return await _handle_list_sessions(arguments)
+        elif name == "container_orch_stop_session":
+            return await _handle_stop_session(arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as exc:
@@ -1245,6 +1360,7 @@ async def _handle_connect(arguments: dict) -> list[TextContent]:
 
     if result.get("success"):
         _get_connected().add(name)
+        _get_connection_info()[name] = {"local_port": result.get("local_port")}
         return [TextContent(type="text", text=result.get("message", f"Connected to '{name}'"))]
 
     return [TextContent(type="text", text=result.get("message", f"Failed to connect to '{name}'"))]
@@ -1269,6 +1385,7 @@ async def _handle_disconnect(arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Disconnect failed: {exc}")]
 
     _get_connected().discard(name)
+    _get_connection_info().pop(name, None)
 
     if ok:
         return [TextContent(type="text", text=f"Disconnected from '{name}'")]
@@ -1307,4 +1424,168 @@ async def _handle_status(arguments: dict) -> list[TextContent]:
             f"  Remote host: {state.get('host', '?')}:{state.get('remote_port', '?')}\n"
             f"  SSH user: {state.get('user', '?')}"
         ),
+    )]
+
+
+async def _handle_create_session(arguments: dict) -> list[TextContent]:
+    """Create a new session on a connected remote host."""
+    name = arguments.get("name")
+    title = arguments.get("title")
+    project = arguments.get("project")
+
+    if not name:
+        return [TextContent(type="text", text="Error: 'name' is required")]
+    if not title:
+        return [TextContent(type="text", text="Error: 'title' is required")]
+    if not project:
+        return [TextContent(type="text", text="Error: 'project' is required")]
+
+    conn_info = _get_connection_info().get(name)
+    if conn_info is None:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Host '{name}' is not connected. "
+                f"Call container_orch_connect first."
+            ),
+        )]
+
+    local_port = conn_info["local_port"]
+    client = OpencodeClient(f"http://127.0.0.1:{local_port}")
+
+    try:
+        result = await client.create_session(title=title, project=project)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Failed to create session: {exc}")]
+
+    if isinstance(result, dict) and "error" in result:
+        return [TextContent(type="text", text=result["error"])]
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+async def _handle_send_prompt(arguments: dict) -> list[TextContent]:
+    """Send a prompt to an existing session on a connected remote host.
+
+    Uses a 120-second timeout to accommodate long-running prompts.
+    Prompt text is sent as HTTP body, never in URL params, to prevent
+    prompt injection via URL logging.
+    """
+    name = arguments.get("name")
+    session_id = arguments.get("session_id")
+    text = arguments.get("text")
+
+    if not name:
+        return [TextContent(type="text", text="Error: 'name' is required")]
+    if not session_id:
+        return [TextContent(type="text", text="Error: 'session_id' is required")]
+    if not text:
+        return [TextContent(type="text", text="Error: 'text' is required")]
+
+    conn_info = _get_connection_info().get(name)
+    if conn_info is None:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Host '{name}' is not connected. "
+                f"Call container_orch_connect first."
+            ),
+        )]
+
+    local_port = conn_info["local_port"]
+    client = OpencodeClient(f"http://127.0.0.1:{local_port}")
+
+    try:
+        result = await client.send_prompt(session_id=session_id, text=text)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Failed to send prompt: {exc}")]
+
+    if isinstance(result, dict):
+        if "error" in result:
+            return [TextContent(type="text", text=result["error"])]
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    return [TextContent(type="text", text=str(result))]
+
+
+async def _handle_list_sessions(arguments: dict) -> list[TextContent]:
+    """List sessions on a connected remote host."""
+    name = arguments.get("name")
+    if not name:
+        return [TextContent(type="text", text="Error: 'name' is required")]
+
+    conn_info = _get_connection_info().get(name)
+    if conn_info is None:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Host '{name}' is not connected. "
+                f"Call container_orch_connect first."
+            ),
+        )]
+
+    local_port = conn_info["local_port"]
+    client = OpencodeClient(f"http://127.0.0.1:{local_port}")
+
+    try:
+        sessions = await client.list_sessions()
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Failed to list sessions: {exc}")]
+
+    if isinstance(sessions, dict) and "error" in sessions:
+        return [TextContent(type="text", text=sessions["error"])]
+
+    if not sessions:
+        return [TextContent(type="text", text=f"No active sessions on '{name}'")]
+
+    lines = [f"Sessions on '{name}' ({len(sessions)}):"]
+    for s in sessions:
+        sid = s.get("session_id", "?")
+        title = s.get("title", "")
+        status = s.get("status", "unknown")
+        lines.append(f"\n\u2022 {title} ({sid})")
+        lines.append(f"  Status: {status}")
+        created = s.get("created_at")
+        if created:
+            lines.append(f"  Created: {created}")
+
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def _handle_stop_session(arguments: dict) -> list[TextContent]:
+    """Stop/cancel a running prompt on a remote session."""
+    name = arguments.get("name")
+    session_id = arguments.get("session_id")
+
+    if not name:
+        return [TextContent(type="text", text="Error: 'name' is required")]
+    if not session_id:
+        return [TextContent(type="text", text="Error: 'session_id' is required")]
+
+    conn_info = _get_connection_info().get(name)
+    if conn_info is None:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Host '{name}' is not connected. "
+                f"Call container_orch_connect first."
+            ),
+        )]
+
+    local_port = conn_info["local_port"]
+    client = OpencodeClient(f"http://127.0.0.1:{local_port}")
+
+    try:
+        ok = await client.stop_session(session_id=session_id)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Failed to stop session: {exc}")]
+
+    if ok:
+        return [TextContent(
+            type="text",
+            text=f"Session '{session_id}' cancelled.",
+        )]
+    return [TextContent(
+        type="text",
+        text=f"Failed to cancel session '{session_id}'.",
     )]
