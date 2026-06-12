@@ -40,6 +40,9 @@ from typing import Any
 import httpx
 import yaml
 
+from mcp.server import Server
+from mcp.types import Tool, TextContent
+
 __all__: list[str] = [
     'validate_hostname',
     'validate_port',
@@ -98,6 +101,36 @@ class SessionInfo:
     title: str = ""
     created_at: str = ""
     status: str = "active"  # active|completed|failed
+
+
+# ── MCP server state ──────────────────────────────────────────────────────────
+
+#: MCP server instance — wired into list_tools/call_tool decorators.
+#: Startup (stdio_server, run loop) is handled externally in the main dispatch.
+server = Server("container_orch")
+
+#: Lazy-initialized config manager (class defined later in this file).
+_config: ConfigManager | None = None
+
+
+def _get_config() -> ConfigManager:
+    global _config
+    if _config is None:
+        _config = ConfigManager()
+    return _config
+
+
+#: Lazy-initialized set of hostnames with active SSH tunnels
+#: (set by SshManager via main dispatch).
+#: Used by ``remove_host`` to refuse removal of a connected host.
+_connected_hosts: set[str] | None = None
+
+
+def _get_connected() -> set[str]:
+    global _connected_hosts
+    if _connected_hosts is None:
+        _connected_hosts = set()
+    return _connected_hosts
 
 
 # ── Input validation ──────────────────────────────────────────────────────────
@@ -902,3 +935,204 @@ class OpencodeClient:
         if status >= 500:
             return {"error": f"Remote server error (HTTP {status})"}
         return {"error": f"HTTP {status}: {exc.response.text[:200]}"}
+
+
+# ── MCP tool definitions ──────────────────────────────────────────────────────
+
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    """Register container orchestration MCP tools."""
+    return [
+        Tool(
+            name="container_orch_list_hosts",
+            description=(
+                "List all configured remote OpenCode hosts. Returns each host's "
+                "name, address, user, tunnel mapping, and connection status. "
+                "Use this to discover available hosts before connecting."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        Tool(
+            name="container_orch_add_host",
+            description=(
+                "Add a new remote OpenCode host to the configuration. "
+                "All fields are validated before saving. "
+                "The host must be reachable via SSH and have OpenCode running."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Friendly host alias (2-64 chars, alphanumeric/underscore/hyphen/space)",
+                    },
+                    "host": {
+                        "type": "string",
+                        "description": "SSH hostname or IP address",
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "SSH port (1-65535)",
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "SSH username",
+                    },
+                    "key_path": {
+                        "type": "string",
+                        "description": "Path to SSH identity file (default: data/ssh/id_ed25519)",
+                    },
+                    "opencode_port": {
+                        "type": "integer",
+                        "description": "Remote OpenCode serving port (default: 4096)",
+                    },
+                    "local_tunnel_port": {
+                        "type": "integer",
+                        "description": "Local tunnel port (auto-assigned if omitted: 14096 + host count)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional description of this host",
+                    },
+                },
+                "required": ["name", "host", "port", "user"],
+            },
+        ),
+        Tool(
+            name="container_orch_remove_host",
+            description=(
+                "Remove a configured remote OpenCode host. "
+                "Refuses to remove a host that currently has an active tunnel. "
+                "Disconnect the host first before removing it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the host to remove",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    """Dispatch tool calls to the appropriate handler."""
+    try:
+        if name == "container_orch_list_hosts":
+            return _handle_list_hosts()
+        elif name == "container_orch_add_host":
+            return _handle_add_host(arguments)
+        elif name == "container_orch_remove_host":
+            return _handle_remove_host(arguments)
+        else:
+            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Error: {exc}")]
+
+
+def _handle_list_hosts() -> list[TextContent]:
+    """Return a formatted list of configured hosts."""
+    try:
+        hosts = _get_config().list_hosts()
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Error reading host configuration: {exc}")]
+
+    if not hosts:
+        return [TextContent(type="text", text="No hosts configured")]
+
+    lines: list[str] = [f"Configured hosts ({len(hosts)}):"]
+    for h in hosts:
+        name = h.get("name", "?")
+        status = "  ● connected" if name in _get_connected() else "  ○ disconnected"
+        lines.append(
+            f"\n• {name}{status}"
+        )
+        lines.append(f"  Host: {h.get('host', '?')}:{h.get('port', '?')}")
+        lines.append(f"  User: {h.get('user', '?')}")
+        tunnel_port = h.get("local_tunnel_port")
+        remote_port = h.get("opencode_port", 4096)
+        if tunnel_port:
+            lines.append(f"  Tunnel: localhost:{tunnel_port} → remote :{remote_port}")
+        desc = h.get("description")
+        if desc:
+            lines.append(f"  Description: {desc}")
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+def _handle_add_host(arguments: dict) -> list[TextContent]:
+    """Validate inputs and add a new host."""
+    name = arguments.get("name")
+    host = arguments.get("host")
+    port = arguments.get("port")
+    user = arguments.get("user")
+    key_path = arguments.get("key_path")
+    opencode_port = arguments.get("opencode_port")
+    local_tunnel_port = arguments.get("local_tunnel_port")
+    description = arguments.get("description", "")
+
+    # Validate required fields are present
+    missing: list[str] = []
+    if not name:
+        missing.append("'name'")
+    if not host:
+        missing.append("'host'")
+    if port is None:
+        missing.append("'port'")
+    if not user:
+        missing.append("'user'")
+    if missing:
+        return [TextContent(
+            type="text",
+            text=f"Missing required fields: {', '.join(missing)}",
+        )]
+
+    # Run the config builder — ConfigManager.add_host calls validate_host_config internally
+    try:
+        _get_config().add_host(
+            name=name,
+            host=host,
+            port=int(port),
+            user=user,
+            key_path=key_path,
+            opencode_port=int(opencode_port) if opencode_port is not None else 4096,
+            local_tunnel_port=int(local_tunnel_port) if local_tunnel_port is not None else None,
+            description=description,
+        )
+    except ValueError as exc:
+        return [TextContent(type="text", text=str(exc))]
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Failed to add host: {exc}")]
+
+    return [TextContent(type="text", text=f"Host '{name}' added successfully")]
+
+
+def _handle_remove_host(arguments: dict) -> list[TextContent]:
+    """Remove a host, refusing if it has an active tunnel."""
+    name = arguments.get("name")
+    if not name:
+        return [TextContent(type="text", text="Error: 'name' is required")]
+
+    if name in _get_connected():
+        return [TextContent(
+            type="text",
+            text=f"Cannot remove host '{name}': it is currently connected. Disconnect it first.",
+        )]
+
+    try:
+        removed = _get_config().remove_host(name)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"Failed to remove host: {exc}")]
+
+    if removed:
+        return [TextContent(type="text", text=f"Host '{name}' removed successfully")]
+    return [TextContent(type="text", text=f"Host '{name}' not found")]
