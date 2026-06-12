@@ -67,10 +67,11 @@ def _find_npx() -> str:
 # carries hundreds of LOC of unique IMAP / HTTP / manager logic not worth
 # duplicating into the native path right now.
 _BUILTIN_SERVERS = {
-    "image_gen":  ("mcp_servers/image_gen_server.py",  "Built-in: Image Generation"),
-    "memory":     ("mcp_servers/memory_server.py",     "Built-in: Memory"),
-    "rag":        ("mcp_servers/rag_server.py",        "Built-in: RAG"),
-    "email":      ("mcp_servers/email_server.py",      "Built-in: Email"),
+    "image_gen":     ("mcp_servers/image_gen_server.py",       "Built-in: Image Generation"),
+    "memory":        ("mcp_servers/memory_server.py",          "Built-in: Memory"),
+    "rag":           ("mcp_servers/rag_server.py",             "Built-in: RAG"),
+    "email":         ("mcp_servers/email_server.py",           "Built-in: Email"),
+    "container_orch": ("mcp_servers/container_orchestrator.py", "Built-in: Container Orchestrator"),
 }
 
 # NPX-based built-in servers (run via npx, not Python)
@@ -85,12 +86,18 @@ _BUILTIN_NPX_SERVERS = {
 # Global flag to disable MCP if there are compatibility issues
 MCP_DISABLED = os.environ.get("ODYSSEUS_DISABLE_MCP", "").lower() in ("1", "true", "yes")
 
+CONTAINER_ORCH_DISABLED = os.environ.get("ODYSSEUS_DISABLE_CONTAINER_ORCH", "").lower() in ("1", "true", "yes")
+
 
 async def register_builtin_servers(mcp_manager):
     """Connect all built-in MCP servers to the manager."""
     if MCP_DISABLED:
         logger.info("Built-in MCP servers disabled via ODYSSEUS_DISABLE_MCP")
         return
+
+    if CONTAINER_ORCH_DISABLED:
+        logger.info("Container Orchestrator MCP server disabled via ODYSSEUS_DISABLE_CONTAINER_ORCH")
+        _BUILTIN_SERVERS.pop("container_orch", None)
 
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     python = sys.executable
