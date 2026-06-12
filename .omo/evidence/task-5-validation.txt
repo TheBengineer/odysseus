@@ -1,0 +1,21 @@
+Task 5 QA - Validation Utilities
+Status: PASS
+Tests: 17/17 passed
+
+  [OK] validate_name valid
+  [OK] validate_name empty
+  [OK] validate_name shell-inject
+  [OK] validate_hostname IPv4
+  [OK] validate_hostname DNS
+  [OK] validate_hostname IPv6
+  [OK] validate_hostname reject-inject
+  [OK] validate_port valid
+  [OK] validate_port 0
+  [OK] validate_port 65536
+  [OK] validate_key_path valid
+  [OK] validate_key_path empty
+  [OK] validate_key_path inject
+  [OK] validate_host_config valid
+  [OK] validate_host_config empty
+  [OK] sanitize clean
+  [OK] sanitize strips-semi
