@@ -31,6 +31,7 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ __all__: list[str] = [
     'sanitize_for_subprocess',
     'validate_host_config',
     'ConfigManager',
+    'SshManager',
 ]
 
 # ── Input validation ──────────────────────────────────────────────────────────
@@ -351,3 +353,301 @@ class ConfigManager:
             if host.get("name") == name:
                 return host
         return None
+
+
+class SshManager:
+    """Manage async SSH tunnel lifecycle for remote OpenCode hosts.
+
+    Connects to remote hosts via SSH, maintains persistent tunnels,
+    and provides health checks. All subprocess invocations use
+    :func:`asyncio.create_subprocess_exec` with a list of arguments
+    (never a shell string) to prevent injection.
+    """
+
+    def __init__(self, config_dir: str) -> None:
+        #: Path to the known_hosts file for SSH connections.
+        self._known_hosts = str(Path(config_dir) / "known_hosts")
+        #: In-memory store of active tunnel connections.
+        #: ``{name: {"process": ..., "local_port": ..., ...}}``
+        self._connections: dict[str, dict[str, Any]] = {}
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    async def connect(self, config: dict) -> dict:
+        """Establish an SSH tunnel to the remote host defined in *config*.
+
+        Validates the configuration, starts the SSH process, waits for the
+        tunnel to become live (via ``ss -tlnp``), and verifies that OpenCode
+        responds on the tunneled port.
+
+        Parameters
+        ----------
+        config : dict
+            Host configuration with keys: ``name``, ``host``, ``port``,
+            ``user``, ``key_path``, ``opencode_port``, ``local_tunnel_port``.
+
+        Returns
+        -------
+        dict
+            ``{"success": True, "name": str, "local_port": int, "message": str}``
+            on success, or ``{"success": False, "name": str, "message": str}``
+            on failure.
+        """
+        # Validate config first
+        errors = validate_host_config(config)
+        if errors:
+            return {
+                "success": False,
+                "name": config.get("name", "?"),
+                "message": f"Invalid config: {'; '.join(errors)}",
+            }
+
+        name = config["name"]
+        host = config["host"]
+        port = config["port"]
+        user = config["user"]
+        key_path = config.get("key_path", "data/ssh/id_ed25519")
+        opencode_port = config.get("opencode_port", 4096)
+        local_port = config.get("local_tunnel_port", 0)
+
+        # Reject duplicate connection name
+        if name in self._connections:
+            return {
+                "success": False,
+                "name": name,
+                "message": f"Connection '{name}' already exists",
+            }
+
+        # Sanitize user-supplied values for subprocess safety
+        safe_host = sanitize_for_subprocess(host)
+        safe_user = sanitize_for_subprocess(user)
+        safe_key = sanitize_for_subprocess(key_path)
+        safe_known_hosts = sanitize_for_subprocess(self._known_hosts)
+
+        # Build SSH command as a list (never a shell string)
+        cmd = [
+            "ssh", "-N",
+            "-L", f"127.0.0.1:{local_port}:127.0.0.1:{opencode_port}",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"UserKnownHostsFile={safe_known_hosts}",
+            "-i", safe_key,
+            "-p", str(port),
+            f"{safe_user}@{safe_host}",
+        ]
+
+        # Launch the SSH process
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (OSError, ValueError) as exc:
+            return {
+                "success": False,
+                "name": name,
+                "message": f"Failed to start SSH process: {exc}",
+            }
+
+        # Track immediately so we can clean up on failure
+        self._connections[name] = {
+            "process": proc,
+            "local_port": local_port,
+            "host": host,
+            "user": user,
+            "opencode_port": opencode_port,
+        }
+
+        # Wait for the tunnel port to appear as listening
+        tunnel_ok = await self._wait_for_tunnel(local_port, timeout=5)
+        if not tunnel_ok:
+            # Capture stderr for diagnostics
+            stderr_text = ""
+            try:
+                _, stderr_data = await asyncio.wait_for(
+                    proc.communicate(), timeout=3.0
+                )
+                stderr_text = stderr_data.decode(errors="replace")
+            except asyncio.TimeoutError:
+                pass
+
+            await self._kill_process(proc)
+
+            # Map common SSH errors to user-friendly messages
+            msg = "SSH tunnel did not establish within 5s"
+            if not stderr_text:
+                msg += " (no error output from SSH)"
+            else:
+                lower = stderr_text.lower()
+                if "permission denied" in lower:
+                    msg = "SSH permission denied -- check key_path and user"
+                elif "connection refused" in lower:
+                    msg = "SSH connection refused -- check host and port"
+                elif "name or service not known" in lower:
+                    msg = "Hostname resolution failed -- check host"
+                else:
+                    msg = f"SSH error: {stderr_text[:200].strip()}"
+
+            del self._connections[name]
+            return {"success": False, "name": name, "message": msg}
+
+        # Verify OpenCode responds through the tunnel
+        opencode_ok = await self._check_opencode_ready(local_port, timeout=10.0)
+        if not opencode_ok:
+            await self._kill_process(proc)
+            del self._connections[name]
+            return {
+                "success": False,
+                "name": name,
+                "message": (
+                    f"Tunnel is up but OpenCode did not respond on "
+                    f"http://127.0.0.1:{local_port}/doc"
+                ),
+            }
+
+        return {
+            "success": True,
+            "name": name,
+            "local_port": local_port,
+            "message": (
+                f"Connected to {host}:{opencode_port} via "
+                f"127.0.0.1:{local_port}"
+            ),
+        }
+
+    async def disconnect(self, name: str) -> bool:
+        """Kill the SSH process for *name* and verify the port is freed.
+
+        Returns ``True`` if the connection was found and terminated,
+        ``False`` if *name* is not tracked.
+        """
+        conn = self._connections.get(name)
+        if conn is None:
+            return False
+
+        proc = conn["process"]
+        local_port = conn["local_port"]
+
+        await self._kill_process(proc)
+        await self._wait_for_port_free(local_port, timeout=3)
+
+        del self._connections[name]
+        return True
+
+    async def disconnect_all(self) -> None:
+        """Terminate all active SSH tunnels."""
+        for name in list(self._connections):
+            await self.disconnect(name)
+
+    async def status(self, name: str) -> dict:
+        """Return a status dictionary for the tunnel named *name*.
+
+        Checks both the process liveness and whether the tunnel port is
+        still listening.
+        """
+        conn = self._connections.get(name)
+        if conn is None:
+            return {"name": name, "connected": False, "error": "not found"}
+
+        proc = conn["process"]
+        process_alive = proc.returncode is None
+        port_open = await self._is_port_listening(conn["local_port"])
+
+        return {
+            "name": name,
+            "connected": process_alive and port_open,
+            "process_alive": process_alive,
+            "port_open": port_open,
+            "local_port": conn["local_port"],
+            "host": conn["host"],
+            "user": conn["user"],
+            "remote_port": conn["opencode_port"],
+        }
+
+    def list_connections(self) -> list[str]:
+        """Return the names of all currently tracked connections."""
+        return list(self._connections.keys())
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    async def _wait_for_tunnel(self, local_port: int, timeout: int = 5) -> bool:
+        """Poll ``ss -tlnp`` until *local_port* appears as listening.
+
+        Returns ``True`` if the port is detected within *timeout* seconds.
+        """
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if await self._is_port_listening(local_port):
+                return True
+            await asyncio.sleep(0.3)
+        return False
+
+    async def _wait_for_port_free(self, local_port: int, timeout: int = 3) -> bool:
+        """Poll ``ss -tlnp`` until *local_port* is no longer listening.
+
+        Returns ``True`` if the port is freed within *timeout* seconds.
+        """
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if not await self._is_port_listening(local_port):
+                return True
+            await asyncio.sleep(0.3)
+        return False
+
+    async def _is_port_listening(self, local_port: int) -> bool:
+        """Return ``True`` if *local_port* appears in ``ss -tlnp`` output."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ss", "-tlnp",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            output = stdout.decode(errors="replace")
+            return f":{local_port}" in output
+        except (OSError, asyncio.TimeoutError):
+            return False
+
+    async def _check_opencode_ready(self, port: int, timeout: float = 10.0) -> bool:
+        """Send ``GET /doc`` to verify OpenCode responds through the tunnel."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=timeout,
+            )
+            request = (
+                b"GET /doc HTTP/1.0\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            )
+            writer.write(request)
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            writer.close()
+            await writer.wait_closed()
+            return response.startswith(b"HTTP/1.")
+        except (OSError, asyncio.TimeoutError, ConnectionError):
+            return False
+
+    async def _kill_process(self, proc: asyncio.subprocess.Process) -> None:
+        """Send SIGTERM, wait 2 s, then SIGKILL if still alive.
+
+        No-op if the process has already exited.
+        """
+        if proc.returncode is not None:
+            return
+
+        try:
+            proc.send_signal(signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.send_signal(signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await proc.wait()

@@ -1,0 +1,11 @@
+{
+  "status": "PASS",
+  "tests": 4,
+  "passed": 4,
+  "results": {
+    "wait-tunnel-timeout": true,
+    "disconnect-nonexistent": true,
+    "list-connections-empty": true,
+    "status-nonexistent": true
+  }
+}
